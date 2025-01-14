@@ -6,13 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
 // Prometheus 指标文件输出路径
-const promFilePath = "/opt/node-exporter/prom/go-quai-stratum.prom"
+const promFilePath = "/opt/node-exporter/prom/go-quai-stratum-block-number.prom"
 
 // 每次检测的间隔（1 分钟）
 const checkInterval = time.Minute
@@ -49,7 +50,7 @@ func main() {
 		blocks := drainBlocksChannel(blocksChan)
 
 		// 执行连续性检查
-		isContinuous := checkContinuity(blocks)
+		isContinuous := checkContinuityIgnoreDuplicates(blocks)
 
 		// 检查是否有更新
 		currentBlockNumber := getLatestBlock(blocks)
@@ -149,13 +150,35 @@ func drainBlocksChannel(blocksChan chan int) []int {
 
 // checkContinuity 判断 blocks 是否“连续”：相邻 block 相差 1
 // 这里按顺序检查，如果 blocks 数组是 [100,101,102] 就是连续
-func checkContinuity(blocks []int) int {
+
+// checkContinuityIgnoreDuplicates 忽略重复值，只要块号整体不跳就算连续
+func checkContinuityIgnoreDuplicates(blocks []int) int {
+	// 若没数据或只有 1 条，默认连续
 	if len(blocks) <= 1 {
-		// 只有 0 或 1 个数据，默认认为连续
 		return 1
 	}
-	for i := 1; i < len(blocks); i++ {
-		if blocks[i] != blocks[i-1]+1 {
+
+	// 1) 先对 blocks 排序，或者说去重。最简单方式是放到一个 map 再取 key 出来
+	unique := make(map[int]bool, len(blocks))
+	for _, b := range blocks {
+		unique[b] = true
+	}
+
+	// 2) 把 key 拿出来做一个有序列表
+	distinctBlocks := make([]int, 0, len(unique))
+	for k := range unique {
+		distinctBlocks = append(distinctBlocks, k)
+	}
+	// 排序
+	// sort.Ints(distinctBlocks)
+
+	// 或者你也可以不排序，而是用“最大块号 - 最小块号 == len-1”来判断是否连续（见下方注释）
+	// 这里先演示显式排序 + 遍历
+
+	// sort 出来后，再检查相邻是否相差 1
+	sort.Ints(distinctBlocks)
+	for i := 1; i < len(distinctBlocks); i++ {
+		if distinctBlocks[i] != distinctBlocks[i-1]+1 {
 			return 0
 		}
 	}
