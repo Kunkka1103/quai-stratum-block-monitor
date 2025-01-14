@@ -14,62 +14,60 @@ import (
 // Prometheus 指标文件输出路径
 const promFilePath = "/opt/node-exporter/prom/go-quai-stratum.prom"
 
-// 每次检测的间隔
+// 每次检测的间隔（1 分钟）
 const checkInterval = time.Minute
 
-// supervisorctl tail --lines=XXX 读取多少行日志，用于截取“最近”日志
-// 具体行数可以根据你的日志产生速率适度调整
-const tailLines = "300"
+// 正则匹配类似：
+// 2025/01/14 10:51:06 Broadcasting block 1513096 to 496 stratum miners
+var logRegex = regexp.MustCompile(`^(\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}:\d{2})\s+Broadcasting block (\d+) to (\d+) stratum miners`)
 
-// 正则示例：
-//  2025/01/14 09:55:34 Broadcasting block 1512464 to 405 stratum miners
-//  ^(2025/01/14 09:55:34) Broadcasting block (1512464) to (405) stratum miners
-// 时间格式：2006/01/02 15:04:05
-var logRegex = regexp.MustCompile(
-	`^(\d{4}\/\d{2}\/\d{2}\s\d{2}:\d{2}:\d{2})\s+Broadcasting block (\d+) to (\d+) stratum miners`,
-)
-
-// 维护一个上次记录的最高区块，用于判断是否“更新”
+// 供主循环判断是否更新
 var lastBlockNumber int
 
 func main() {
-	// 第一次跑可以把 lastBlockNumber 设置成 -1 或 0，表示还没拿过区块
+	// 初始化
 	lastBlockNumber = -1
 
+	// 用来实时接收日志中解析到的 blockNumber
+	blocksChan := make(chan int, 1000) // 带缓冲，避免堵塞
+
+	// 启动一个 goroutine 实时“流式”读取日志
+	go func() {
+		err := readBlocksStream("go-quai-stratum", blocksChan)
+		if err != nil {
+			fmt.Printf("[ERROR] readBlocksStream: %v\n", err)
+			// 如果这里出错退出，主程序就收不到日志了
+			// 根据需要决定是否重试，或者干脆主程序退出让 Supervisor 重启
+		}
+	}()
+
+	// 进入主循环，每分钟分析一次
 	for {
-		// 每次循环的起始时间
 		startTime := time.Now()
 
-		// 读取“过去一分钟”内的所有区块高度
-		blocks, err := readRecentBlocks("go-quai-stratum", startTime.Add(-checkInterval))
-		if err != nil {
-			fmt.Printf("[ERROR] readRecentBlocks: %v\n", err)
-			// 即使报错，也要等下一个周期重试
-			sleepUntilNext(startTime)
-			continue
-		}
+		// 从 channel 中取出“过去这一分钟”里收到的所有区块高度
+		blocks := drainBlocksChannel(blocksChan)
 
-		// 连续性检查
+		// 执行连续性检查
 		isContinuous := checkContinuity(blocks)
 
-		// 是否更新检查
+		// 检查是否有更新
 		currentBlockNumber := getLatestBlock(blocks)
 		isUpdated := 1
 		if currentBlockNumber == lastBlockNumber {
 			isUpdated = 0
 		} else if currentBlockNumber > 0 {
-			// 当拿到有效的最新区块时才更新全局记录
 			lastBlockNumber = currentBlockNumber
 		}
 
-		// 写入 Prom 文件
-		if err := writePromMetrics(isContinuous, isUpdated); err != nil {
+		// 写入 Prometheus 文件
+		err := writePromMetrics(isContinuous, isUpdated)
+		if err != nil {
 			fmt.Printf("[ERROR] writePromMetrics: %v\n", err)
 		}
 
-		// 打印一些调试日志，便于观察
-		fmt.Printf(
-			"[DEBUG] time=%s, foundBlocks=%d, blocks=%v, continuity=%d, updated=%d, lastBlockNumber=%d\n",
+		// 打印调试日志
+		fmt.Printf("[DEBUG] %s => foundBlocks=%d, blocks=%v, continuity=%d, updated=%d, lastBlockNumber=%d\n",
 			time.Now().Format("2006-01-02 15:04:05"),
 			len(blocks),
 			blocks,
@@ -78,93 +76,82 @@ func main() {
 			lastBlockNumber,
 		)
 
-		// 等待下一次循环
-		sleepUntilNext(startTime)
+		// 等待下一轮
+		time.Sleep(checkInterval - time.Since(startTime))
 	}
 }
 
-// readRecentBlocks 调用 `supervisorctl tail <serviceName> --lines=300` 读取最近若干行日志，
-// 并从中筛选出在 afterTime 之后的日志行，返回解析得到的 block 列表。
-func readRecentBlocks(serviceName string, afterTime time.Time) ([]int, error) {
-	// 调 supervisorctl:  tail --lines=300 <serviceName>
-	cmd := exec.Command("supervisorctl", "tail", serviceName, "--lines="+tailLines)
+// readBlocksStream 用 supervisorctl tail -f 命令实时读取日志行，
+// 解析出 blockNumber，送到 blocksChan
+func readBlocksStream(serviceName string, blocksChan chan<- int) error {
+	// 根据 Supervisor 版本，若要读取 stdout，可能需要加上 "stdout" 参数:
+	// supervisorctl tail -f <serviceName> stdout
+	// 如果你的 Supervisor 不区分 stdout/stderr，就可以直接 tail -f <serviceName>
+	cmd := exec.Command("supervisorctl", "tail", "-f", serviceName, "stdout")
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("cmd.StdoutPipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("cmd.Start: %w", err)
+		return fmt.Errorf("StdoutPipe error: %w", err)
 	}
 
-	lines := make([]string, 0)
+	// 启动命令
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("cmd.Start error: %w", err)
+	}
+
+	// 在同一个 goroutine 中做扫描
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		line := scanner.Text()
+		// 可以加些调试输出:
+		// fmt.Printf("[TRACE] raw log line: %s\n", line)
+
+		// 解析“Broadcasting block ...”
+		if matches := logRegex.FindStringSubmatch(line); len(matches) == 4 {
+			blockStr := matches[2] // group(2) 是 block number
+			blockNum, err := strconv.Atoi(blockStr)
+			if err == nil {
+				blocksChan <- blockNum
+			}
+		}
 	}
+
+	// 扫描结束（可能是 supervisorctl 退出）
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanner.Err: %w", err)
+		return fmt.Errorf("scanner error: %w", err)
 	}
 
 	// 等待子进程退出
 	if err := cmd.Wait(); err != nil {
-		// supervisorctl tail 命令可能返回状态码非0，不一定就是错误
-		// 这里简单记录一下
-		fmt.Printf("[WARN] supervisorctl tail exit: %v\n", err)
+		// supervisorctl tail -f 常常不会正常退出，除非进程被杀
+		// 这里记录一下
+		return fmt.Errorf("cmd.Wait error: %w", err)
 	}
 
-	fmt.Printf("[DEBUG] readRecentBlocks: total lines read=%d\n", len(lines))
-
-	// 从这些行里，提取在 afterTime 之后的 block
-	blocks := make([]int, 0)
-	for _, line := range lines {
-		t, blockNum, ok := parseTimeAndBlock(line)
-		if !ok {
-			// 不符合正则或解析失败就跳过
-			continue
-		}
-		if t.After(afterTime) {
-			blocks = append(blocks, blockNum)
-		}
-	}
-
-	fmt.Printf("[DEBUG] readRecentBlocks: lines after %s => blocks=%v\n",
-		afterTime.Format("15:04:05"),
-		blocks,
-	)
-
-	return blocks, nil
+	return nil
 }
 
-// parseTimeAndBlock 从一行形如
-//   "2025/01/14 09:55:34 Broadcasting block 1512464 to 405 stratum miners"
-// 中解析出 (time, blockNumber)。若解析成功返回 (t, blockNum, true)，否则 (零值, 0, false)。
-func parseTimeAndBlock(line string) (time.Time, int, bool) {
-	matches := logRegex.FindStringSubmatch(line)
-	if len(matches) != 4 {
-		return time.Time{}, 0, false
+// drainBlocksChannel 将 channel 中当前可读的数据全部读取出来
+// 如果这 1 分钟内日志很多，可能拿到很多 blockNum。否则就少
+func drainBlocksChannel(blocksChan chan int) []int {
+	var blocks []int
+	// 循环取，直到 channel 读不到数据
+	for {
+		select {
+		case b := <-blocksChan:
+			blocks = append(blocks, b)
+		default:
+			// channel 为空时跳出
+			return blocks
+		}
 	}
-	// 解析时间
-	tStr := matches[1] // "2025/01/14 09:55:34"
-	blockStr := matches[2] // "1512464"
-	// minersStr := matches[3] // "405" (如果需要，可以留着)
-
-	t, err := time.Parse("2006/01/02 15:04:05", tStr)
-	if err != nil {
-		return time.Time{}, 0, false
-	}
-	blockNum, err := strconv.Atoi(blockStr)
-	if err != nil {
-		return time.Time{}, 0, false
-	}
-
-	return t, blockNum, true
 }
 
-// checkContinuity 判断 blocks 是否严格连续
-// 如果只有 0 或 1 个区块，也可以视为连续（返回1）
+// checkContinuity 判断 blocks 是否“连续”：相邻 block 相差 1
+// 这里按顺序检查，如果 blocks 数组是 [100,101,102] 就是连续
 func checkContinuity(blocks []int) int {
 	if len(blocks) <= 1 {
+		// 只有 0 或 1 个数据，默认认为连续
 		return 1
 	}
 	for i := 1; i < len(blocks); i++ {
@@ -175,7 +162,7 @@ func checkContinuity(blocks []int) int {
 	return 1
 }
 
-// getLatestBlock 返回 blocks 中的最大值，若 blocks 为空则返回 -1
+// getLatestBlock 返回最后一个块，如果没有则返回 -1
 func getLatestBlock(blocks []int) int {
 	if len(blocks) == 0 {
 		return -1
@@ -183,7 +170,7 @@ func getLatestBlock(blocks []int) int {
 	return blocks[len(blocks)-1]
 }
 
-// writePromMetrics 将两个指标写入 promFilePath
+// writePromMetrics 将两个指标写入 Prometheus 文件
 func writePromMetrics(isContinuous, isUpdated int) error {
 	content := strings.Join([]string{
 		fmt.Sprintf("quai_stratum_block_number_continuity %d", isContinuous),
@@ -191,14 +178,6 @@ func writePromMetrics(isContinuous, isUpdated int) error {
 		"",
 	}, "\n")
 
-	// 若 /opt/node-exporter/prom 目录不存在，需要手动创建并赋予权限
+	// 确保 /opt/node-exporter/prom 目录存在，且 Node Exporter 能访问
 	return os.WriteFile(promFilePath, []byte(content), 0644)
-}
-
-// sleepUntilNext 让程序休眠到下个 checkInterval 周期
-func sleepUntilNext(start time.Time) {
-	sleepDuration := checkInterval - time.Since(start)
-	if sleepDuration > 0 {
-		time.Sleep(sleepDuration)
-	}
 }
